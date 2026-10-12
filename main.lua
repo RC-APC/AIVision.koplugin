@@ -6,6 +6,7 @@ local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local UIManager = require("ui/uimanager")
 local InfoMessage = require("ui/widget/infomessage")
 local InputDialog = require("ui/widget/inputdialog")
+local ConfirmBox = require("ui/widget/confirmbox")
 local DataStorage = require("datastorage")
 local json = require("json")
 local util = require("util")
@@ -125,6 +126,18 @@ function AIVision:fileSize(p)
     local sz = f:seek("end"); f:close()
     return sz or 0
 end
+function AIVision:fileDelete(p)
+    local ok = pcall(os.remove, p)
+    return ok and not self:fileExists(p)
+end
+-- 人类可读的体积
+function AIVision:prettySize(n)
+    if not n or n <= 0 then return "0KB" end
+    if n < 1024 then return n .. "B" end
+    if n < 1024 * 1024 then return string.format("%.0fKB", n / 1024) end
+    return string.format("%.1fMB", n / (1024 * 1024))
+end
+function AIVision:imgPath(id) return self.img_dir .. "/" .. id .. ".png" end
 
 -- ⚠ 关键：Kindle 上 socket.http 不支持 https，连国内 API 必须用 ssl.https（LuaSec）
 function AIVision:httpModule(url)
@@ -171,6 +184,10 @@ function AIVision:addToMainMenu(menu_items)
             {
                 text = "设置豆包 Key（Seedream 兜底）",
                 callback = function() self:showSetKey("doubao_key", "豆包 Seedream") end,
+            },
+            {
+                text = "🗑 清空历史记录（图片需手动删文件）",
+                callback = function() self:confirmClearHistory() end,
             },
         },
     }
@@ -230,6 +247,12 @@ function AIVision:onGenerateFromSelection(rh)
         id = req_id, text = text, book = book, page = page,
         status = "pending", ts = os.time(),
     })
+    -- 只保留最近 MAX_QUEUE 条，更早的记录连带其图片一起清掉（避免无限堆积）
+    local MAX_QUEUE = 50
+    while #self.queue > MAX_QUEUE do
+        local old = table.remove(self.queue)
+        if old and old.status == "done" then self:fileDelete(self:imgPath(old.id)) end
+    end
     self:writeJson(self.data_dir .. "/queue.json", self.queue)
 
     pcall(function() rh:onClose() end)
@@ -415,9 +438,48 @@ function AIVision:setStatus(req_id, status, err)
 end
 
 -- ===== 下拉：记录列表 =====
+-- 清空历史记录：只清 queue 列表，不动 images/ 里的图片文件
+-- （图片交由用户在文件管理器里自行清理，避免误删）
+function AIVision:clearHistory()
+    local n = #(self.queue or {})
+    self.queue = {}
+    self:writeJson(self.data_dir .. "/queue.json", self.queue)
+    return n
+end
+
+function AIVision:confirmClearHistory()
+    local n = #(self.queue or {})
+    if n == 0 then
+        UIManager:show(InfoMessage:new{ text = "没有记录可清空" })
+        return
+    end
+    UIManager:show(ConfirmBox:new{
+        title = "清空历史记录",
+        text = "将清空 " .. n .. " 条生成记录。\n\n图片文件不会被删除，如需清理请到：\n" .. self.img_dir,
+        ok_text = "清空",
+        cancel_text = "取消",
+        ok_callback = function()
+            local c = self:clearHistory()
+            UIManager:show(InfoMessage:new{
+                text = "已清空 " .. c .. " 条记录\n图片请到文件夹手动删除",
+            })
+            self:showGallery()
+        end,
+    })
+end
+
 function AIVision:showGallery()
     local Menu = require("ui/widget/menu")
     local items = {}
+    local n_img, total_bytes = 0, 0
+    for _, it in ipairs(self.queue or {}) do
+        if it.status == "done" then
+            n_img = n_img + 1
+            total_bytes = total_bytes + self:fileSize(self:imgPath(it.id))
+        end
+    end
+
+    -- ── 功能区（与设置 Key 同层级，轻点即触发）──
     table.insert(items, {
         text = "🔑 设置智谱 Key（当前：" .. ((self.config.zhipu_key and self.config.zhipu_key ~= "") and "已设" or "空") .. "）",
         callback = function() self:showSetKey("zhipu_key", "智谱 CogView") end,
@@ -425,25 +487,40 @@ function AIVision:showGallery()
     table.insert(items, {
         text = "🔑 设置豆包 Key（当前：" .. ((self.config.doubao_key and self.config.doubao_key ~= "") and "已设" or "空") .. "）",
         callback = function() self:showSetKey("doubao_key", "豆包 Seedream") end,
+    })
+    table.insert(items, {
+        text = "🗑 清空历史记录（" .. #(self.queue or {}) .. " 条）",
+        callback = function() self:confirmClearHistory() end,
         separator = true,
     })
+
+    -- ── 记录区 ──
     for _, it in ipairs(self.queue or {}) do
-        local st
-        if it.status == "done" then st = "✓ 已生成"
+        local st, sz = "", ""   -- 必须给初值：failed/pending 分支不赋 sz，拼 nil 会报错
+        if it.status == "done" then
+            st = "✓"
+            local b = self:fileSize(self:imgPath(it.id))
+            sz = (b > 0) and ("  " .. self:prettySize(b)) or "  (文件缺失)"
         elseif it.status == "failed" then st = "✗ " .. (it.error or "失败")
         else st = "… 生成中" end
-        local label = (it.text:sub(1, 26)) .. (it.text:len() > 26 and "…" or "") .. "  [" .. st .. "]"
+        local body = (it.text or ""):gsub("%s+", " ")
+        local label = st .. " " .. body:sub(1, 26) .. ((#body > 26) and "…" or "") .. sz
         table.insert(items, {
             text = label,
             callback = function() self:showImage(it) end,
         })
     end
+
+    local footer = "📁 图片目录：" .. self.img_dir
+        .. (n_img > 0 and ("\n共 " .. n_img .. " 张 / " .. self:prettySize(total_bytes)) or "")
     local title = (#(self.queue or {}) == 0)
         and "AI 生图记录（先设置 Key：智谱主力 / 豆包兜底）"
         or "AI 生图记录"
     UIManager:show(Menu:new{
         title = title,
         item_table = items,
+        covers_fullscreen = false,
+        footer_text = footer,
     })
 end
 
@@ -455,7 +532,7 @@ function AIVision:showImage(it)
         })
         return
     end
-    local path = self.img_dir .. "/" .. it.id .. ".png"
+    local path = self:imgPath(it.id)
     if not (self:fileExists(path) and self:fileSize(path) > 0) then
         UIManager:show(InfoMessage:new{
             text = "图片文件缺失，请重新生图",
