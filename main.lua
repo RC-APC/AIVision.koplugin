@@ -47,24 +47,64 @@ function AIVision:init(ui)
     self.queue = self:readJson(self.data_dir .. "/queue.json") or {}
 
     if self.ui and self.ui.highlight and self.ui.highlight.addToHighlightDialog then
-        self.ui.highlight:addToHighlightDialog("99_ai_vision", function(this)
+        -- 按钮1：AI 生图 / 查看插图（按场景动态切换）
+        -- 选中文字(未高亮)：直接生图并存画廊（不建高亮）
+        -- 已有高亮且已绑图：显示「查看插图」
+        -- 已有高亮但无图：生图并绑到该高亮
+        self.ui.highlight:addToHighlightDialog("99_ai_vision", function(this, index)
+            local ann = (index and this.ui and this.ui.annotation) and this.ui.annotation.annotations[index] or nil
+            local img = ann and ann.aivision_image or nil
+            if img and self:fileExists(img) then
+                return {
+                    text = "查看插图",
+                    callback = function()
+                        local ok2, err = pcall(function() self:viewBoundImage(img) end)
+                        if not ok2 then logger.warn("AIVision: 查看插图异常", tostring(err)) end
+                    end,
+                }
+            end
+            local bind = ann and index or nil
             return {
                 text = "AI 生图",
                 callback = function()
-                    -- 兜底：任何异常都不能让阅读器崩掉
-                    local ok2, err = pcall(function() self:onGenerateFromSelection(this) end)
+                    local ok2, err = pcall(function() self:onGenerateFromSelection(this, bind) end)
                     if not ok2 then
                         logger.warn("AIVision: 生图入口异常", tostring(err))
                         pcall(function()
-                            UIManager:show(InfoMessage:new{
-                                text = "AI 生图出错：" .. tostring(err),
-                            })
+                            UIManager:show(InfoMessage:new{ text = "AI 生图出错：" .. tostring(err) })
                         end)
                     end
                 end,
             }
         end)
-        logger.info("AIVision: 选区按钮「AI 生图」已注入")
+        -- 按钮2：高亮并生图 / 重绑插图（按场景动态切换）
+        -- 选中文字(未高亮)：新建高亮并生图、把图绑到该高亮
+        -- 已有高亮：重新生成并覆盖绑定的图
+        self.ui.highlight:addToHighlightDialog("98_ai_vision_hl", function(this, index)
+            local ann = (index and this.ui and this.ui.annotation) and this.ui.annotation.annotations[index] or nil
+            if ann then
+                return {
+                    text = "重绑插图",
+                    callback = function()
+                        local ok2, err = pcall(function() self:onGenerateFromSelection(this, index) end)
+                        if not ok2 then logger.warn("AIVision: 重绑异常", tostring(err)) end
+                    end,
+                }
+            end
+            return {
+                text = "高亮并生图",
+                callback = function()
+                    local ok2, err = pcall(function() self:onHighlightAndGenerate(this) end)
+                    if not ok2 then
+                        logger.warn("AIVision: 高亮并生图异常", tostring(err))
+                        pcall(function()
+                            UIManager:show(InfoMessage:new{ text = "AI 生图出错：" .. tostring(err) })
+                        end)
+                    end
+                end,
+            }
+        end)
+        logger.info("AIVision: 选区按钮已注入（AI 生图 / 高亮并生图）")
     end
 
     -- 菜单条目交给框架自动调用 addToMainMenu（见下方方法），这里不手动插入。
@@ -215,13 +255,18 @@ function AIVision:showSetKey(key, label)
 end
 
 -- ===== 选区按钮 → 发送 =====
-function AIVision:onGenerateFromSelection(rh)
-    local text = ""
-    pcall(function()
-        if rh and rh.selected_text and rh.selected_text.text then
-            text = util.cleanupSelectedText(rh.selected_text.text)
-        end
-    end)
+-- bind_index：可选，传入则生图成功后把图绑定到该高亮（annotations[index].aivision_image）
+-- pre_text：可选，调用方预先取出的文字，避免 saveHighlight 后选区被清导致取不到
+function AIVision:onGenerateFromSelection(rh, bind_index, pre_text)
+    self._pending_bind = bind_index  -- 供延迟调度的 generate 读取
+    local text = pre_text or ""
+    if (not text or text == "") then
+        pcall(function()
+            if rh and rh.selected_text and rh.selected_text.text then
+                text = util.cleanupSelectedText(rh.selected_text.text)
+            end
+        end)
+    end
     if (not text or text == "") and rh and rh.hold_pos and rh.hold_pos.text then
         text = rh.hold_pos.text
     end
@@ -289,7 +334,7 @@ function AIVision:generate(req_id, prompt, book, page)
             local got, why = self:saveFromResponse(j, path)
             if got then
                 self:setStatus(req_id, "done", "")
-                UIManager:show(InfoMessage:new{ text = "AI 生图完成（智谱 CogView）" })
+                self:finishWithBind(path, "智谱 CogView")
                 return
             end
             table.insert(tried, "智谱:" .. tostring(why))
@@ -311,7 +356,7 @@ function AIVision:generate(req_id, prompt, book, page)
             local got, why = self:saveFromResponse(j, path)
             if got then
                 self:setStatus(req_id, "done", "")
-                UIManager:show(InfoMessage:new{ text = "AI 生图完成（豆包 Seedream）" })
+                self:finishWithBind(path, "豆包 Seedream")
                 return
             end
             table.insert(tried, "豆包:" .. tostring(why))
@@ -325,6 +370,67 @@ function AIVision:generate(req_id, prompt, book, page)
     self:setStatus(req_id, "failed", table.concat(tried, " | "))
     UIManager:show(InfoMessage:new{
         text = "AI 生图失败：\n" .. table.concat(tried, "\n"),
+    })
+end
+
+-- 生图成功后的收尾：若本次有绑定高亮则绑定，并给出对应提示
+function AIVision:finishWithBind(path, backend)
+    local bind = self._pending_bind
+    self._pending_bind = nil
+    if bind then
+        self:bindImageToHighlight(bind, path)
+        UIManager:show(InfoMessage:new{ text = "图片生成成功，点击高亮文本查看" })
+    else
+        UIManager:show(InfoMessage:new{ text = "AI 生图完成（" .. backend .. "）" })
+    end
+end
+
+-- 把图片路径绑到指定高亮，并随 annotation 一起持久化（不改变原书，仅记在 .sdr 元数据）
+function AIVision:bindImageToHighlight(index, path)
+    pcall(function()
+        local ann = self.ui and self.ui.annotation and self.ui.annotation.annotations[index]
+        if not ann then return end
+        ann.aivision_image = path
+        -- 让框架在关闭文档时一并保存；这里再显式触发一次 annotation 落盘
+        if self.ui.annotation.onSaveSettings then
+            pcall(self.ui.annotation.onSaveSettings, self.ui.annotation)
+        end
+    end)
+end
+
+-- 高亮并生图：先创建高亮拿到索引，再生图并把图绑到该高亮
+function AIVision:onHighlightAndGenerate(rh)
+    -- 先取出文字：saveHighlight 后选区可能被清，提前保存最稳
+    local text = ""
+    pcall(function()
+        if rh and rh.selected_text and rh.selected_text.text then
+            text = util.cleanupSelectedText(rh.selected_text.text)
+        end
+    end)
+    local index = nil
+    pcall(function()
+        if rh and rh.saveHighlight then index = rh:saveHighlight() end
+    end)
+    if not index then
+        -- 建高亮失败（例如没有选中文字），退回直接生图
+        UIManager:show(InfoMessage:new{ text = "无法创建高亮，已改为直接生图" })
+        self:onGenerateFromSelection(rh, nil, text)
+        return
+    end
+    self:onGenerateFromSelection(rh, index, text)
+end
+
+-- 查看绑定在高亮上的插图
+function AIVision:viewBoundImage(path)
+    if not (path and self:fileExists(path)) then
+        UIManager:show(InfoMessage:new{ text = "插图文件缺失" })
+        return
+    end
+    local ImageViewer = require("ui/widget/imageviewer")
+    UIManager:show(ImageViewer:new{
+        file = path,
+        dither = true,
+        with_title_bar = false,
     })
 end
 
